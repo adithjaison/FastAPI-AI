@@ -1,0 +1,405 @@
+PDF CHATBOT — INGESTION DATA PIPELINE (design, as built)
+====================================================================================================
+Legend:  ✅ built   ⚠ gap / risk   ◻ planned (not built)
+Last reviewed against the code: 2026-10-04
+
+
+1. THE BIG PICTURE
+----------------------------------------------------------------------------------------------------
+A RAG system is two pipelines. This document covers the first one.
+
+  ┌─ INGESTION PIPELINE (offline, async)  ← THIS DOCUMENT ─────────────────────────────────────────┐
+  │ upload → store file → event → queue → EXTRACT → TRANSFORM → LOAD                                │
+  │                                       (parse)   (clean, chunk, embed)  (Postgres + pgvector)    │
+  └─────────────────────────────────────────────────────────────────────────────────────────────────┘
+                                         │ documents with status INDEXED
+                                         ▼
+  ┌─ QUERY PIPELINE (online, per question)  ◻ not built ───────────────────────────────────────────┐
+  │ question → embed (same model) → RETRIEVE → AUGMENT prompt → GENERATE (LLM) → answer + pages    │
+  └─────────────────────────────────────────────────────────────────────────────────────────────────┘
+
+  Stage map
+    ① Upload ✅ → ② Outbox relay ✅ → ③ Queue ✅ → ④ Extract ✅ → ⑤ Chunk ✅ → ⑥ Embed ✅
+    → ⑦ Load ✅ → ⑧ Retrieve ◻ → ⑨ Generate ◻
+
+
+2. COMPONENTS (docker compose)
+----------------------------------------------------------------------------------------------------
+  Service         Image / command                                   Role in ingestion
+  ─────────────── ───────────────────────────────────────────────── ───────────────────────────────
+  backend         backend image · uvicorn --reload :8090             upload API; runs init_db at start
+  outbox_relay    backend image · python -m modules.outbox.relay     outbox → RabbitMQ
+  rabbitmq        rabbitmq:4.0-management · :5672 (UI :15672)        task queue "celery"
+  celery_worker   backend image · celery worker prefork ×4           extract → chunk → embed → load
+  postgres        pgvector/pgvector:pg17 (vector 0.8.7)              documents, chunks, vectors, outbox
+  minio           chainguard/minio · volume minio_data               original PDF files
+  redis           redis                                              Celery result backend only
+  Ollama          NATIVE on the Mac (not Docker) → Metal GPU         embedding model
+                  reached from containers at http://host.docker.internal:11434
+
+
+3. DATA MODEL
+----------------------------------------------------------------------------------------------------
+  documents
+    id               serial PK
+    filename         text
+    object_key       text UNIQUE            "<uuid4>/<filename>" in MinIO bucket "documents"
+    mime_type        text
+    size_type        bigint                 bytes
+    content_hash     text UNIQUE            sha256 of the file → deduplication
+    status           enum UPLOADED | PROCESSING | INDEXING | INDEXED | FAILED
+    error            text                   reason when FAILED
+    embedding_model  text                   e.g. qwen3-embedding:0.6b (needed to re-embed later)
+    created_at / updated_at   timestamptz   updated_at drives stale-claim recovery
+
+  document_chunks                           ONE table: text + vector + keyword index in the same row
+    id               serial PK
+    document_id      int FK → documents ON DELETE CASCADE   (indexed)
+    chunk_index      int                    0,1,2… across the document; UNIQUE(document_id, chunk_index)
+    page_number      int                    for citations
+    content          text                   what the LLM will read
+    embedding        vector(1024) NOT NULL  DENSE vector  → HNSW index, vector_cosine_ops
+    content_tsv      tsvector GENERATED     LEXICAL index → GIN index (filled by Postgres)
+    created_at       timestamptz
+
+  outbox_events
+    id, aggregate_type, aggregate_id, event_type, payload jsonb,
+    status PENDING | PUBLISHED | FAILED, attempts, last_error, created_at, published_at
+    partial index on created_at WHERE status = PENDING
+
+  Note: pgvector is NOT a separate store. It adds the `vector` type, distance operators
+  (<=> cosine) and the HNSW index to the same Postgres. One INSERT writes text + vector.
+
+
+4. INGESTION FLOW
+----------------------------------------------------------------------------------------------------
+  CLIENT
+    │ POST /api/v1/pdf_chatbot/upload   (multipart/form-data, field "file")
+    │   ⚠ no authentication
+    ▼
+  ┌─ ① UPLOAD · backend (FastAPI, async) ───────────────────────────────────────────────────────────┐
+  │ STARTUP   lifespan → storage.ensure_bucket()                                            ✅      │
+  │           start_dev_server.sh → init_db: RESET_DB wipes schema → CREATE EXTENSION vector        │
+  │           → create_all                                                                  ✅      │
+  │           ⚠ RESET_DB runs on every backend start, while relay/worker may be connected           │
+  │                                                                                                 │
+  │ ROUTER    UPLOAD_SLOTS = asyncio.Semaphore(5) per process; full → 503 immediately       ✅      │
+  │           Depends(get_db) → AsyncSession per request · Depends(get_storage) → MinIO client      │
+  │                                                                                                 │
+  │ SERVICE   upload_document()                                                                     │
+  │  1 VALIDATE  content_type == application/pdf → else 400                                ✅      │
+  │              ⚠ header is client-supplied (no "%PDF-" magic-byte check)                          │
+  │              ⚠ no size limit; whole file read into RAM                                          │
+  │              empty file → 400                                                          ✅      │
+  │  2 DEDUPE    sha256 → existing document? return it                                    ✅      │
+  │              content_hash UNIQUE in DB                                                 ✅      │
+  │              ⚠ IntegrityError from a simultaneous duplicate isn't caught → 500                  │
+  │  3 STORE     MinIO put_object via asyncio.to_thread, key <uuid4>/<filename>          ✅      │
+  │              ⚠ filename not sanitised                                                           │
+  │  4 PERSIST   ONE transaction: INSERT documents (UPLOADED) → flush → id                         │
+  │                               INSERT outbox_events (document.uploaded, PENDING,                 │
+  │                                 payload {document_id, object_key}) → COMMIT            ✅      │
+  │              error → rollback + delete the MinIO file (compensation)                   ✅      │
+  │              ⚠ crash between 3 and 4 → orphan MinIO file (needs a cleanup job)                  │
+  │  5 RESPOND   201 DocumentResponse                                                      ✅      │
+  └─────────────────────────────────────────────────────────────────────────────────────────────────┘
+    │ rows in Postgres — the request never talks to RabbitMQ
+    ▼
+  ┌─ ② OUTBOX RELAY · outbox_relay (separate process, loop forever) ────────────────────────────────┐
+  │ SELECT ≤50 PENDING ORDER BY created_at FOR UPDATE SKIP LOCKED                          ✅      │
+  │ unknown event_type → FAILED immediately                                                ✅      │
+  │ send in parallel: asyncio.Semaphore(10) + asyncio.to_thread(send_task)                          │
+  │                   + gather(return_exceptions=True); task_id = "outbox-<event id>"      ✅      │
+  │ results (DB touched only after gather):                                                         │
+  │   sent → PUBLISHED, published_at = now()                                                        │
+  │   broker down → stays PENDING, no attempt counted                                               │
+  │   other error → attempts+1, last_error; 5 → FAILED                                              │
+  │ COMMIT · nothing sent → sleep 2 s · DB error → back off 1,2,4…60 s, never exits        ✅      │
+  │ Delivery guarantee: AT LEAST ONCE (crash after send, before commit → resent)                    │
+  └─────────────────────────────────────────────────────────────────────────────────────────────────┘
+    │ AMQP {task: pdf_chatbot.process_document, id: outbox-N, kwargs: {document_id, object_key}}
+    │ serializer json only (no pickle)                                                         ✅
+    ▼
+  ┌─ ③ QUEUE · rabbitmq ────────────────────────────────────────────────────────────────────────────┐
+  │ queue "celery"; message unacked until the task finishes (acks_late)                    ✅      │
+  │ ⚠ no volume: recreating the container loses queued messages whose events are PUBLISHED          │
+  │ ⚠ command still waits for backend:8090 (backend crash → RabbitMQ exits)                         │
+  └─────────────────────────────────────────────────────────────────────────────────────────────────┘
+    │ prefetch = 1 per worker process
+    ▼
+  ┌─ celery_worker · process_document(document_id, object_key) ─────────────────────────────────────┐
+  │ pool prefork, concurrency 4 (CELERY_POOL / CELERY_CONCURRENCY in .env; solo for ipdb)  ✅      │
+  │ worker_process_init → sync_engine.dispose(close=False)                                 ✅      │
+  │ acks_late + reject_on_worker_lost (crash → redelivered) · time limits soft 600 / hard 660 ✅   │
+  │ ⚠ worker also waits for backend:8090 · ⚠ no auto-reload: restart after code changes           │
+  │                                                                                                 │
+  │  0 CLAIM     atomic UPDATE … SET PROCESSING WHERE status = UPLOADED                             │
+  │              (or PROCESSING/INDEXING untouched > 15 min) RETURNING id                           │
+  │              lost → return {"skipped": True}                                           ✅      │
+  │ ── ④ EXTRACT ───────────────────────────────────────────────────────────────────────────────── │
+  │  1 DOWNLOAD  minio get_object → bytes (close + release_conn)                           ✅      │
+  │  2 PARSE     pypdf per page → [(page_no, text)]; unreadable → PdfParseError            ✅      │
+  │ ── ⑤ TRANSFORM: CHUNK ──────────────────────────────────────────────────────────────────────── │
+  │  3 CHUNK     whitespace normalised; 1000 chars, 200 overlap, within each page;                  │
+  │              keeps page_number; no text at all → PdfParseError (scanned PDF)          ✅      │
+  │ ── ⑥ TRANSFORM: EMBED ──────────────────────────────────────────────────────────────────────── │
+  │  4 STATUS    INDEXING                                                                  ✅      │
+  │  5 EMBED     embed_texts(): Ollama qwen3-embedding:0.6b via /v1 (OpenAI-compatible)             │
+  │              batches of 32 · asyncio.Semaphore(1) (one local GPU) · timeout 120 s · retries 2   │
+  │              checks: one vector per chunk, each 1024 numbers; blank text rejected  ✅      │
+  │              documents get NO instruction prefix (questions will)                               │
+  │ ── ⑦ LOAD ──────────────────────────────────────────────────────────────────────────────────── │
+  │  6 SAVE      ONE transaction:                                                                   │
+  │                DELETE old chunks of this document                                               │
+  │                INSERT chunks: content + embedding (content_tsv generated by Postgres)           │
+  │                UPDATE documents: INDEXED, embedding_model, error = NULL                ✅      │
+  │              rerun-safe (idempotent); text and vector can never get out of sync                 │
+  │  → result {document_id, chunks} → Redis (expires 1 h)                                           │
+  │                                                                                                 │
+  │ ERRORS                                                                                          │
+  │   TRANSIENT  MinIO (urllib3 HTTPError), Postgres (OperationalError),                            │
+  │              Ollama unreachable/timeout (APIConnectionError), Ollama 5xx (InternalServerError)  │
+  │              → status UPLOADED (release claim) → retry in 5,10,20,40,80 s → then FAILED         │
+  │   PERMANENT  bad/scanned PDF, wrong vector size (EmbeddingError), model not pulled              │
+  │              (NotFoundError), time limit, bugs → FAILED + documents.error, no retry             │
+  └─────────────────────────────────────────────────────────────────────────────────────────────────┘
+    │
+    ▼
+  POSTGRES (pgvector)  documents ─1:N─ document_chunks (content + embedding + content_tsv)
+  MINIO                original PDFs
+  REDIS                task results
+
+
+5. STATUS LIFECYCLE
+----------------------------------------------------------------------------------------------------
+                 claim() wins                 save_chunks()
+     UPLOADED ──────────────► PROCESSING ──► INDEXING ──────────► INDEXED ✓
+        ▲                         │              │
+        │ transient error         │ permanent    │ permanent
+        └── release + retry ──────┤ error        │ error
+                                  ▼              ▼
+                                FAILED ◄─────────┘   (reason in documents.error)
+
+     duplicate delivery → claim() loses → skipped, nothing touched
+     PROCESSING / INDEXING untouched > 15 min → claim() may take over (crashed worker)
+
+
+6. WHAT IS INDEXED: DENSE vs LEXICAL
+----------------------------------------------------------------------------------------------------
+  Representation   Column        Built by                   Index            Status
+  ──────────────── ───────────── ────────────────────────── ──────────────── ─────────────────────
+  Dense vectors    embedding     qwen3-embedding:0.6b       HNSW cosine      ✅ stored, ◻ not queried
+                                 (semantic meaning)
+  Lexical tokens   content_tsv   Postgres to_tsvector       GIN              ✅ stored, ◻ not queried
+                                 ('english', content)
+  Learned sparse   —             (SPLADE / BGE-M3 sparse)   —                ◻ not planned for now
+
+  • Only DENSE embeddings are produced by a model. That's the semantic half.
+  • The LEXICAL half already exists at storage level: Postgres builds content_tsv automatically
+    on every insert (stemmed words, e.g. "programming" → "program"). It catches exact terms that
+    embeddings handle poorly: names, IDs, "#210637381", "Rennell Road".
+  • Neither is used yet. Hybrid search is a QUERY-pipeline job (⑧ Retrieve):
+        dense top-20  (ORDER BY embedding <=> :qvec)
+      + lexical top-20 (WHERE content_tsv @@ websearch_to_tsquery(...) ORDER BY ts_rank_cd)
+      → Reciprocal Rank Fusion → top 5
+  • ts_rank_cd is not true BM25. If ranking quality matters later: a BM25 extension
+    (e.g. ParadeDB pg_search) or learned sparse vectors (pgvector `sparsevec` type).
+
+
+7. CONFIGURATION (docker/.env)
+----------------------------------------------------------------------------------------------------
+  RESET_DB=True                         dev: wipe + recreate schema on backend start
+  CELERY_POOL=prefork                   solo only while debugging with ipdb
+  CELERY_CONCURRENCY=4                  PDFs processed in parallel
+  OLLAMA_BASE_URL=http://host.docker.internal:11434
+  EMBEDDING_MODEL=qwen3-embedding:0.6b  1024 dims, 32K-token input, ~0.7 s per 32 chunks (M2 Pro)
+  EMBEDDING_DIMENSIONS=1024             must match vector(1024) in the table
+  EMBEDDING_CONCURRENCY=1               one local GPU
+  EMBEDDING_BATCH_SIZE=32               (default if unset)
+  LLM_MODEL=qwen3.5:9b                  for the query pipeline (◻)
+
+
+8. RELIABILITY & RESILIENCE
+----------------------------------------------------------------------------------------------------
+  Failure                                   What happens                                Handled by
+  ───────────────────────────────────────── ─────────────────────────────────────────── ─────────────────────────
+  DB fails during upload                    rollback, MinIO file deleted, 500           service try/except
+  Crash after MinIO upload, before commit   orphan file ⚠                               ◻ cleanup job
+  Two identical uploads at the same moment  DB rejects 2nd (UNIQUE), but 500 ⚠          ◻ catch IntegrityError
+  RabbitMQ down when the event is created   nothing lost: event waits PENDING           outbox pattern
+  RabbitMQ down while relaying              PENDING, no attempt counted, retry in 2 s   relay BrokerUnavailable
+  Relay crash after send, before commit     task sent twice                             claim()
+  Several relays                            events split, never sent twice at once      SKIP LOCKED
+  Postgres down for the relay               rollback, backoff ≤ 60 s, keeps running     relay main()
+  Schema reset while relay is connected     one failed batch, then recovers ⚠           backoff (◻ db_init service)
+  Worker killed mid-task                    redelivered; stale claim after 15 min       acks_late, claim()
+  Duplicate task, 4 workers in parallel     only one claims; others skip                atomic claim()
+  MinIO / DB / Ollama blip in the worker    retry 5,10,20,40,80 s, then FAILED          TRANSIENT_ERRORS
+  Ollama model not pulled                   FAILED with "model not found"               NotFoundError → permanent
+  Corrupt or scanned PDF                    FAILED with reason                          PdfParseError
+  PDF or embedding hangs                    soft 600 s → FAILED; hard 660 s kills       Celery time limits
+  Retry after partial save                  old chunks replaced, no duplicates          delete+insert, one tx
+  Too many uploads at once                  503 after 5 in progress (per process)       UPLOAD_SLOTS
+  RabbitMQ container recreated              queued messages lost ⚠                      ◻ volume + stuck sweeper
+
+
+9. SECURITY
+----------------------------------------------------------------------------------------------------
+  ✅ Done                                              ⚠ Gap
+  ─────────────────────────────────────────────────── ────────────────────────────────────────────────
+  JSON-only Celery serialization                      no authentication on upload
+  Parameterised SQL (SQLAlchemy) everywhere           content type trusted (no %PDF- magic bytes)
+  UUID object keys (no overwrites)                    no upload size limit
+  response_model controls API output                  raw filename in object key
+  secrets in .env, not code                           app uses MinIO root account
+  SQL echo off (no document text in logs)             all service ports published; Redis no password
+  documents never leave the Mac (local Ollama)        RabbitMQ UI exposed on :15672
+  content_hash UNIQUE                                 —
+
+
+10. OPEN ITEMS (ingestion)
+----------------------------------------------------------------------------------------------------
+  ⚠ pdf_tasks.py: remove RateLimitError (Ollama never raises it); fix "Gve up after retires"
+    and the missing ")" in "(scanned/image-only PDF?"
+  ⚠ service.py: catch IntegrityError on commit → return the existing document
+  ⚠ upload: %PDF- magic-byte check, max size, sanitise filename
+  ⚠ compose: remove `wait-for backend:8090` from rabbitmq and celery_worker; add a RabbitMQ volume
+  ⚠ compose: db_init one-shot service so RESET_DB runs before relay/worker connect
+  ⚠ worker auto-reload in dev: watchfiles --filter python "celery … worker …" /backend
+  ⚠ requirements.txt: remove the unrelated `nc` PyPI package
+  ◻ Celery Beat jobs: re-queue documents stuck in UPLOADED, delete orphan MinIO files,
+    prune old PUBLISHED outbox rows
+  ◻ GET /documents/{id} status endpoint
+  ◻ more file types: only the EXTRACT step changes (parser chosen by MIME type, same
+    [(page_no, text)] output) — chunk/embed/load stay the same
+
+
+11. TESTING (backend/tests, pytest, no mocks)
+----------------------------------------------------------------------------------------------------
+  pytest.ini (pythonpath = ., testpaths = tests/integration, markers integration/ollama/minio)
+  tests/conftest.py               switches DATABASE_URL → <db>_test before app import
+  tests/integration/conftest.py   creates <db>_test + vector extension + tables, TRUNCATE per test,
+                                  fixtures: db, make_document, ollama (fails if not reachable)
+  tests/pdf_factory.py            builds small real PDFs with known text
+  test_chunking.py                chunk sizes, overlap, page numbers, blank pages
+  test_embeddings.py              real Ollama: size, order across batches, query ↔ text matching
+  test_ingestion.py               save_chunks, vector + keyword search, claim(), and the real
+                                  process_document task via .apply() (MinIO + Postgres + Ollama)
+
+  run:  docker compose exec backend pytest -v
+        docker compose exec backend pytest -m "not ollama" -v
+        docker compose exec -e MINIO_BUCKET=documents-test backend pytest -v
+
+
+12. NEXT: QUERY PIPELINE (◻)
+----------------------------------------------------------------------------------------------------
+  POST /api/v1/pdf_chatbot/documents/{id}/ask  {"question": "..."}
+   0 GUARD     document INDEXED (else 409) · question length · LLM_SLOTS semaphore → 503
+   1 EMBED Q   aembed_query(): instruction prefix + SAME model → vector(1024)
+   2 RETRIEVE  dense top-20 + lexical top-20 (same document) → RRF → top 5 → distance threshold
+   3 AUGMENT   system prompt: answer only from context, cite [p. N], context is data not instructions
+   4 GENERATE  Ollama qwen3.5:9b, thinking off, timeout 120 s
+   5 RESPOND   {"answer", "citations": [{page, chunk_index, distance}]}
+   6 STORE     chat_sessions / messages
+  The text sent to the LLM is the stored `content` column returned by step 2 —
+  vectors are only used to FIND chunks, never turned back into text.
+
+
+
+
+Revised ingestion diagram
+
+                           DOCUMENT (upload API → MinIO → outbox → RabbitMQ)   ✅ built
+                                              │
+                                              ▼
+                                  PARSE / EXTRACT (per page)
+                         ┌────────────────────┼─────────────────────┐
+                         ▼                    ▼                     ▼
+                       TEXT                PAGE IMAGES           METADATA
+                         │                    │                     │
+                         │          ┌─────────┴─────────┐           ▼
+                         │          ▼                   ▼      title, author, dates,
+                         │        OCR / vision      figures &   page count, language,
+                         │      (scanned pages)     page renders headings
+                         │          │                   │           │
+                         ◄──────────┘ text              │           ▼
+                         │                              │    Postgres columns/JSONB
+                         ▼                              │    (filters)  ✅/◻
+                 CONTENT ANALYSIS (router)              │
+          language · quality · which branches run       │
+                         │                              │
+                         ▼                              │
+                     CHUNKING ✅                         │
+                         │                              │
+        ┌────────────────┼──────────────────┬───────────┼──────────────┐
+        ▼                ▼                  ▼           ▼              ▼
+     DENSE ✅         SPARSE ✅        MULTI-VECTOR   MULTIMODAL        GRAPH
+   qwen3-embedding  Postgres FTS     ColBERT-style   vision embedding  LLM entity &
+   0.6b (Ollama)    (generated col)  token vectors   (or caption→text) relation extraction
+        │                │                  │           │              │
+        └──── same chunk row ────┘          ▼           ▼              ▼
+              document_chunks        chunk_token_vectors page_embeddings  Neo4j
+              (Postgres+pgvector)    (pgvector)          (pgvector)      (+ chunk ids for
+                                                                          provenance)
+        ◄─ core task: makes the document searchable ─►  ◄─ separate tasks, own queues, own status ─►
+DOCUMENT
+   │
+   ▼
+PARSE / EXTRACT
+   │
+   ├── TEXT ───────────────────────────────┐
+   │                                       │
+   ├── PAGE IMAGE ── OCR ──► TEXT ─────────┤
+   │                                       │
+   ├── FIGURES / IMAGES                    │
+   │                                       │
+   └── METADATA                            │
+                                           ▼
+                                  CONTENT ANALYSIS
+                                  / ROUTER
+                                           │
+                                           ▼
+                                      CHUNKING
+                                           │
+                       ┌───────────────────┼───────────────────┐
+                       │                   │                   │
+                       ▼                   ▼                   ▼
+                    CHUNK 1             CHUNK 2             CHUNK 3
+                       │
+                       │
+             SAME CHUNK CAN GO
+             TO MULTIPLE BRANCHES
+                       │
+          ┌────────────┼─────────────┬──────────────┬─────────────┐
+          ▼            ▼             ▼              ▼             ▼
+       DENSE        SPARSE       MULTI-VECTOR    MULTIMODAL     GRAPH
+          │            │             │              │             │
+       Qwen3        FTS          ColBERT         Vision       Entity/
+       Embedding                  vectors        embedding      relation
+          │            │             │              │             │
+          ▼            ▼             ▼              ▼             ▼
+      pgvector      tsvector    token vectors   pgvector       Neo4j
+
+The text branch as a whole
+
+PDF ──► PARSE (pypdf, per page)
+          │
+          ▼
+   CONTENT ANALYSIS · document          has text? quality? clean (headers, spaced letters)
+          │                             language → FTS config · size caps
+          │                             decide branches → document_index_jobs
+          ▼
+      CHUNKING (1000 / 200, per page)
+          │
+          ▼
+   CONTENT ANALYSIS · chunk             drop junk chunks · mark graph_eligible
+          │
+          ├──────────────────────────────────────────────────────┐ core task (fast)
+          ▼                                                      │
+   DENSE  qwen3-embedding:0.6b  ─┐                               │
+   SPARSE Postgres FTS (auto)   ─┴─► document_chunks ─► INDEXED   │  searchable
+          │                                                      ┘
+          │ outbox events
+          ├─► MULTI-VECTOR task  all chunks      ─► chunk_token_vectors (pgvector)   own status
+          ├─► GRAPH task         graph_eligible  ─► Neo4j (entities, relations)      own status
+          └─  MULTIMODAL         SKIPPED (no images branch yet)

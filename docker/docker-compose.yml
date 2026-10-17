@@ -1,0 +1,85 @@
+x-common: &x-common
+  env_file: .env
+  networks:
+    - fastapi_network
+
+services:
+  backend: &backend
+    <<: *x-common
+    container_name: backend
+    build:
+      context: ../
+      dockerfile: docker/backend/Dockerfile
+    ports:
+      - "8090:8090"
+    stdin_open: true
+    tty: true
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - ../backend:/backend
+
+  postgres:
+    <<: *x-common
+    container_name: postgres
+    build: ./postgres
+    ports:
+      - "15433:5432"
+
+  redis:
+    <<: *x-common
+    container_name: redis
+    build: ./redis
+    ports:
+      - "16379:6379"
+
+  rabbitmq:
+    <<: *x-common
+    container_name: rabbitmq
+    build: ./rabbitmq
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+    command: wait-for backend:8090 -t 120 -- rabbitmq-server
+
+  outbox_relay:
+    <<: *backend
+    ports: []
+    container_name: outbox_relay
+    command: python -m modules.outbox.relay
+
+  minio:
+    <<: *x-common
+    container_name: minio
+    build: ./minio
+    ports:
+      - "9222:9000"
+      - "9223:9001"
+    command: [ "server", "--console-address", ":9001", "/data" ]
+    volumes:
+      - minio_data:/data
+
+  neo4j:
+    <<: *x-common
+    container_name: neo4j
+    build: ./neo4j
+    ports:
+      - "7687:7687"
+      - "7474:7474"
+    volumes:
+      - neo4j_data:/data
+
+  celery_worker:
+    <<: *backend
+    ports: []
+    container_name: celery_worker
+    command: /scripts/wait-for rabbitmq:5672 -t 120 -- /scripts/wait-for backend:8090 -t 120 -- celery -A workers.celery_app worker -l info --pool=${CELERY_POOL:-prefork} --concurrency=${CELERY_CONCURRENCY:-4}
+    stdin_open: true
+    tty: true
+
+volumes:
+  minio_data:
+  neo4j_data:
+
+networks:
+  fastapi_network:

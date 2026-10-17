@@ -1,0 +1,1 @@
+FROM chainguard/minio:latest
