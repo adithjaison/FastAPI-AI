@@ -181,7 +181,7 @@ retrieval_backup_2026-10-11.tar.gz
 # Icon must end with two \r
 Icon
 
-
+backend/tests/fixtures/sample.pdf
 # Thumbnails
 ._*
 
